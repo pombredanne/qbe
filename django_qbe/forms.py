@@ -30,6 +30,13 @@ SORT_CHOICES = (
     ("des", _("Descending")),
 )
 
+BACKEND_TO_OPERATIONS = {
+    'mysql': 'MySQLOperations',
+    'oracle': 'OracleOperations',
+    'postgis': 'PostGISOperations',
+    'spatialite': 'SpatiaLiteOperations',
+}
+
 
 class QueryByExampleForm(forms.Form):
     show = forms.BooleanField(label=_("Show"), required=False)
@@ -98,7 +105,10 @@ class BaseQueryByExampleFormSet(BaseFormSet):
             pass
         if base_mod and intros_mod:
             self._db_operators = base_mod.DatabaseWrapper.operators
-            DatabaseOperations = base_mod.DatabaseOperations
+            if module.startswith('django.contrib.gis'):
+                DatabaseOperations = getattr(base_mod, BACKEND_TO_OPERATIONS[module.split('.')[-1]])
+            else:
+                DatabaseOperations = base_mod.DatabaseOperations
             try:
                 self._db_operations = DatabaseOperations(self._db_connection)
             except TypeError:
@@ -175,9 +185,14 @@ class BaseQueryByExampleFormSet(BaseFormSet):
                     join_field = qn(over_split[1])
                     if model in self._models:
                         _field = self._models[model]._meta.get_field(field)
+                        # Backwards compatibility for Django 1.3
+                        if hasattr(_field, "db_column") and _field.db_column:
+                            _field_db_column = _field.db_column
+                        else:
+                            _field_db_column = _field.attname
                         join = u"%s.%s = %s.%s" \
                                % (join_model, join_field, qn(model),
-                                  qn(_field.db_column))
+                                  qn(_field_db_column))
                     else:
                         join = u"%s.%s = %s" \
                                % (join_model, join_field,
