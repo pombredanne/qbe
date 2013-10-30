@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import collections
 from django import forms
 from django.db import connections
 from django.db.models.fields import Field
@@ -8,6 +9,7 @@ from django.forms.formsets import BaseFormSet, formset_factory
 from django.utils.importlib import import_module
 from django.utils.translation import ugettext as _
 
+from django_qbe.operators import CustomOperator, BACKEND_TO_OPERATIONS
 from django_qbe.utils import get_models
 from django_qbe.widgets import CriteriaInput
 
@@ -30,21 +32,16 @@ SORT_CHOICES = (
     ("des", _("Descending")),
 )
 
-BACKEND_TO_OPERATIONS = {
-    'mysql': 'MySQLOperations',
-    'oracle': 'OracleOperations',
-    'postgis': 'PostGISOperations',
-    'spatialite': 'SpatiaLiteOperations',
-}
-
 
 class QueryByExampleForm(forms.Form):
     show = forms.BooleanField(label=_("Show"), required=False)
+    alias = forms.CharField(label=_("Show as"), required=False)
     model = forms.CharField(label=_("Model"))
     field = forms.CharField(label=_("Field"))
     criteria = forms.CharField(label=_("Criteria"), required=False)
     sort = forms.ChoiceField(label=_("Sort"), choices=SORT_CHOICES,
                              required=False)
+    group_by = forms.BooleanField(label=_("Group by"), required=False)
 
     def __init__(self, *args, **kwargs):
         super(QueryByExampleForm, self).__init__(*args, **kwargs)
@@ -82,9 +79,11 @@ class QueryByExampleForm(forms.Form):
 
 class BaseQueryByExampleFormSet(BaseFormSet):
     _selects = []
+    _aliases = []
     _froms = []
     _wheres = []
     _sorts = []
+    _groups_by = []
     _params = []
     _models = {}
     _raw_query = None
@@ -92,6 +91,7 @@ class BaseQueryByExampleFormSet(BaseFormSet):
     _db_operators = {}
     _db_table_names = []
     _db_operations = None
+    _custom_operators = CustomOperator.get_operators()
 
     def __init__(self, *args, **kwargs):
         self._db_alias = kwargs.pop("using", "default")
@@ -106,7 +106,8 @@ class BaseQueryByExampleFormSet(BaseFormSet):
         if base_mod and intros_mod:
             self._db_operators = base_mod.DatabaseWrapper.operators
             if module.startswith('django.contrib.gis'):
-                DatabaseOperations = getattr(base_mod, BACKEND_TO_OPERATIONS[module.split('.')[-1]])
+                operations_name = BACKEND_TO_OPERATIONS[module.split('.')[-1]]
+                DatabaseOperations = getattr(base_mod, operations_name)
             else:
                 DatabaseOperations = base_mod.DatabaseOperations
             try:
@@ -128,14 +129,17 @@ class BaseQueryByExampleFormSet(BaseFormSet):
             # Don't bother validating the formset unless each form is valid on
             # its own
             return
-        selects, froms, wheres, sorts, params = self.get_query_parts()
+        (selects, aliases, froms, wheres, sorts, groups_by,
+         params) = self.get_query_parts()
         if not selects:
             validation_message = _(u"At least you must check a row to get.")
             raise forms.ValidationError, validation_message
         self._selects = selects
+        self._aliases = aliases
         self._froms = froms
         self._wheres = wheres
         self._sorts = sorts
+        self._groups_by = groups_by
         self._params = params
 
     def get_query_parts(self):
@@ -143,9 +147,11 @@ class BaseQueryByExampleFormSet(BaseFormSet):
         Return SQL query for cleaned data
         """
         selects = []
+        aliases = []
         froms = []
         wheres = []
         sorts = []
+        groups_by = []
         params = []
         app_model_labels = None
         lookup_cast = self._db_operations.lookup_cast
@@ -169,15 +175,21 @@ class BaseQueryByExampleFormSet(BaseFormSet):
                 self._models[model] = app_models[position]
             field = data["field"]
             show = data["show"]
+            alias = data["alias"]
             criteria = data["criteria"]
             sort = data["sort"]
+            group_by = data["group_by"]
             db_field = u"%s.%s" % (qn(model), qn(field))
             operator, over = criteria
             is_join = operator.lower() == 'join'
             if show and not is_join:
                 selects.append(db_field)
+            if alias and not is_join:
+                aliases.append(alias)
             if sort:
                 sorts.append(db_field)
+            if group_by:
+                groups_by.append(db_field)
             if all(criteria):
                 if is_join:
                     over_split = over.lower().rsplit(".", 1)
@@ -198,7 +210,7 @@ class BaseQueryByExampleFormSet(BaseFormSet):
                                % (join_model, join_field,
                                   u"%s_id" % db_field)
                     if (join not in wheres
-                        and uqn(join_model) in self._db_table_names):
+                            and uqn(join_model) in self._db_table_names):
                         wheres.append(join)
                         if join_model not in froms:
                             froms.append(join_model)
@@ -210,12 +222,30 @@ class BaseQueryByExampleFormSet(BaseFormSet):
                     db_operator = self._db_operators[operator]
                     lookup = self._get_lookup(operator, over)
                     params.append(lookup)
-                    wheres.append(u"%s %s" \
+                    wheres.append(u"%s %s"
                                   % (lookup_cast(operator) % db_field,
                                      db_operator))
+                elif operator in self._custom_operators.keys():
+                    CustOperator = self._custom_operators[operator]
+                    custom_operator = CustOperator(db_field, operator, over)
+
+                    # make sure the operators params are iterable:
+                    custom_params = custom_operator.get_params()
+                    if isinstance(custom_params, collections.Iterable):
+                        params += custom_params
+                    else:
+                        params += [custom_params, ]
+
+                    # make sure the operators wheres are iterable:
+                    custom_wheres = custom_operator.get_wheres()
+                    if isinstance(custom_wheres, collections.Iterable):
+                        wheres += custom_wheres
+                    else:
+                        wheres += [custom_wheres, ]
+
             if qn(model) not in froms and model in self._db_table_names:
                 froms.append(qn(model))
-        return selects, froms, wheres, sorts, params
+        return selects, aliases, froms, wheres, sorts, groups_by, params
 
     def get_raw_query(self, limit=None, offset=None, count=False,
                       add_extra_ids=False, add_params=False):
@@ -225,6 +255,10 @@ class BaseQueryByExampleFormSet(BaseFormSet):
             order_by = u"ORDER BY %s" % (", ".join(self._sorts))
         else:
             order_by = u""
+        if self._groups_by:
+            group_by = u"GROUP BY %s" % (", ".join(self._groups_by))
+        else:
+            group_by = u""
         if self._wheres:
             wheres = u"WHERE %s" % (" AND ".join(self._wheres))
         else:
@@ -232,7 +266,7 @@ class BaseQueryByExampleFormSet(BaseFormSet):
         if count:
             selects = (u"COUNT(*) as count", )
             order_by = u""
-        elif add_extra_ids:
+        elif add_extra_ids and not group_by:
             selects = self._get_selects_with_extra_ids()
         else:
             selects = self._selects
@@ -248,11 +282,12 @@ class BaseQueryByExampleFormSet(BaseFormSet):
                 offsets = u"OFFSET %s" % int(offset)
             except ValueError:
                 pass
-        sql = u"""SELECT %s FROM %s %s %s %s %s;""" \
+        sql = u"""SELECT %s FROM %s %s %s %s %s %s;""" \
               % (", ".join(selects),
                  ", ".join(self._froms),
                  wheres,
                  order_by,
+                 group_by,
                  limits,
                  offsets)
         if add_params:
@@ -265,7 +300,7 @@ class BaseQueryByExampleFormSet(BaseFormSet):
         """
         Fetch all results after perform SQL query and
         """
-        add_extra_ids = (admin_name != None)
+        add_extra_ids = (admin_name is not None)
         if not query:
             sql = self.get_raw_query(limit=limit, offset=offset,
                                      add_extra_ids=add_extra_ids)
@@ -276,7 +311,7 @@ class BaseQueryByExampleFormSet(BaseFormSet):
         cursor = self._db_connection.cursor()
         cursor.execute(sql, tuple(self._params))
         query_results = cursor.fetchall()
-        if admin_name:
+        if admin_name and not self._groups_by:
             selects = self._get_selects_with_extra_ids()
             results = []
             try:
@@ -301,9 +336,11 @@ class BaseQueryByExampleFormSet(BaseFormSet):
                                                     _model._meta.module_name)
                         else:
                             _appmodel = appmodel
-                        admin_url = reverse("%s:%s_change" % (admin_name,
-                                                              _appmodel),
-                                             args=[row[i + 1]])
+                        admin_url = reverse("%s:%s_change" % (
+                            admin_name,
+                            _appmodel),
+                            args=[row[i + 1]]
+                        )
                     except NoReverseMatch:
                         admin_url = None
                     result.append((row[i], admin_url))
@@ -330,11 +367,14 @@ class BaseQueryByExampleFormSet(BaseFormSet):
         else:
             return len(self.get_results())
 
-    def get_labels(self, add_extra_ids=False, row_number=False):
+    def get_labels(self, add_extra_ids=False, row_number=False, aliases=False):
         if row_number:
             labels = [_(u"#")]
         else:
             labels = []
+        if aliases:
+            labels.extend(self._aliases)
+            return labels
         if add_extra_ids:
             selects = self._get_selects_with_extra_ids()
         else:
@@ -348,6 +388,9 @@ class BaseQueryByExampleFormSet(BaseFormSet):
                                         label_splits_field)
                 labels.append(label)
         return labels
+
+    def has_admin_urls(self):
+        return not bool(self._groups_by)
 
     def _unquote_name(self, name):
         quoted_space = self._db_operations.quote_name("")
